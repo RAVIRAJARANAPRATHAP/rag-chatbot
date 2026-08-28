@@ -9,7 +9,6 @@ from pypdf import PdfReader
 import docx
 import base64
 import os
-import io
 
 load_dotenv()
 
@@ -47,6 +46,12 @@ def load_llm():
 
 llm = load_llm()
 tavily = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+
+def friendly_error(e):
+    msg = str(e).lower()
+    if "rate" in msg or "quota" in msg or "429" in msg:
+        return "I'm getting a lot of requests right now and hit a temporary rate limit (this app runs on a free tier). Please wait 30-60 seconds and try again."
+    return "Something went wrong processing that request. Please try again in a moment."
 
 def extract_text_from_upload(file):
     if file.type == "application/pdf":
@@ -86,7 +91,6 @@ def answer_question(question, uploaded_files):
     if any(kw in question.lower() for kw in time_keywords):
         return "Here's the current date and time:\n\n" + get_current_time(), []
 
-    # Separate images from text-based documents
     image_files = [f for f in (uploaded_files or []) if f.type.startswith("image/")]
     doc_files = [f for f in (uploaded_files or []) if not f.type.startswith("image/")]
 
@@ -95,7 +99,6 @@ def answer_question(question, uploaded_files):
         f.seek(0)
         doc_context += f"\n\n--- Content from {f.name} ---\n{extract_text_from_upload(f)}"
 
-    # If images are uploaded, use Gemini's vision capability
     if image_files:
         content = [{"type": "text", "text": f"{doc_context}\n\nQuestion: {question}" if doc_context else question}]
         for img_file in image_files:
@@ -107,18 +110,24 @@ def answer_question(question, uploaded_files):
                 "image_url": f"data:{img_file.type};base64,{b64_img}"
             })
         message = HumanMessage(content=content)
-        response = llm.invoke([message])
-        answer_text = response.content[0]["text"] if isinstance(response.content, list) else response.content
+        try:
+            response = llm.invoke([message])
+            answer_text = response.content[0]["text"] if isinstance(response.content, list) else response.content
+        except Exception as e:
+            answer_text = friendly_error(e)
         return answer_text, [f.name for f in image_files + doc_files]
 
     sources = []
     search_context = ""
 
     if needs_search(question) and not doc_context:
-        search_results = tavily.search(query=question, max_results=4)
-        for r in search_results.get("results", []):
-            search_context += f"{r['content']}\n\n"
-            sources.append(r["url"])
+        try:
+            search_results = tavily.search(query=question, max_results=4)
+            for r in search_results.get("results", []):
+                search_context += f"{r['content']}\n\n"
+                sources.append(r["url"])
+        except Exception:
+            pass  # fall back to general knowledge if search fails
 
     combined_context = doc_context + "\n\n" + search_context
 
@@ -134,8 +143,11 @@ Answer clearly and concisely."""
     else:
         prompt = f"Answer this question using your general knowledge: {question}"
 
-    response = llm.invoke(prompt)
-    answer_text = response.content[0]["text"] if isinstance(response.content, list) else response.content
+    try:
+        response = llm.invoke(prompt)
+        answer_text = response.content[0]["text"] if isinstance(response.content, list) else response.content
+    except Exception as e:
+        answer_text = friendly_error(e)
 
     if doc_files:
         sources = [f.name for f in doc_files] + sources
