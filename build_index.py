@@ -24,13 +24,16 @@ for filename in os.listdir(docs_folder):
     if filename.endswith(".pdf"):
         path = os.path.join(docs_folder, filename)
         reader = PdfReader(path)
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text() + "\n"
-        text_chunks = chunk_text(text)
-        for chunk in text_chunks:
-            all_chunks.append(Document(page_content=chunk, metadata={"source": filename}))
-        print(f"Loaded {filename}: split into {len(text_chunks)} chunks")
+        for page_num, page in enumerate(reader.pages, start=1):
+            page_text = page.extract_text() or ""
+            text_chunks = chunk_text(page_text)
+            for chunk in text_chunks:
+                if chunk.strip():
+                    all_chunks.append(Document(
+                        page_content=chunk,
+                        metadata={"source": filename, "page": page_num}
+                    ))
+        print(f"Loaded {filename}: {len(reader.pages)} pages")
 
 print(f"\nTotal chunks: {len(all_chunks)}")
 
