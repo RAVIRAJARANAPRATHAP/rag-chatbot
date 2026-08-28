@@ -1,12 +1,19 @@
 import streamlit as st
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from langchain_chroma import Chroma
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import HumanMessage
+from tavily import TavilyClient
 from dotenv import load_dotenv
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from pypdf import PdfReader
+import docx
+import base64
 import os
+import io
 
 load_dotenv()
 
-st.set_page_config(page_title="DocuMind AI", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="Aria Assistant", page_icon="✨", layout="wide")
 
 st.markdown("""
 <style>
@@ -16,67 +23,122 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.header("🧠 DocuMind AI")
-    st.markdown("An AI assistant that answers questions from your documents, with source citations.")
+    st.header("✨ Aria Assistant")
+    st.markdown("Ask anything. Upload files or images for extra context.")
     st.divider()
-    st.subheader("📄 Loaded Documents")
-    for f in os.listdir("docs"):
-        if f.endswith(".pdf"):
-            st.markdown(f"- {f}")
+
+    uploaded_files = st.file_uploader(
+        "📎 Upload documents or images",
+        type=["pdf", "docx", "txt", "png", "jpg", "jpeg"],
+        accept_multiple_files=True
+    )
+
     st.divider()
     if st.button("🗑️ Clear Chat"):
         st.session_state.messages = []
         st.rerun()
 
-st.title("🧠 DocuMind AI")
-st.caption("Ask questions and get answers grounded in your documents — with sources.")
+st.title("✨ Aria Assistant")
+st.caption("General knowledge, live web search, and file/image understanding.")
 
 @st.cache_resource
-def load_chain():
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
-    vectorstore = Chroma(embedding_function=embeddings, persist_directory="chroma_db")
-    llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash")
-    return vectorstore, llm
+def load_llm():
+    return ChatGoogleGenerativeAI(model="gemini-3.6-flash")
 
-vectorstore, llm = load_chain()
+llm = load_llm()
+tavily = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
 
-def answer_question(question):
+def extract_text_from_upload(file):
+    if file.type == "application/pdf":
+        reader = PdfReader(file)
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    elif file.name.endswith(".docx"):
+        doc = docx.Document(file)
+        return "\n".join(p.text for p in doc.paragraphs)
+    elif file.type == "text/plain":
+        return file.read().decode("utf-8")
+    return ""
+
+def get_current_time():
+    utc_now = datetime.now(ZoneInfo("UTC"))
+    zones = {
+        "India (IST)": "Asia/Kolkata",
+        "New York (EST/EDT)": "America/New_York",
+        "London (GMT/BST)": "Europe/London",
+        "Tokyo (JST)": "Asia/Tokyo",
+    }
+    lines = [f"**UTC:** {utc_now.strftime('%A, %B %d, %Y - %I:%M %p')}"]
+    for name, zone in zones.items():
+        local_time = utc_now.astimezone(ZoneInfo(zone))
+        lines.append(f"**{name}:** {local_time.strftime('%A, %B %d, %Y - %I:%M %p')}")
+    return "\n\n".join(lines)
+
+def needs_search(question):
+    triggers = ["current", "latest", "today", "now", "recent", "price", "who is the", "score", "news", "weather"]
+    return any(t in question.lower() for t in triggers)
+
+def answer_question(question, uploaded_files):
     greetings = ["hi", "hello", "hey", "how are you", "good morning", "good evening"]
     if question.lower().strip("?! ") in greetings:
-        return "Hello! Ask me anything — I'll check my documents first, and use my general knowledge if the answer isn't there.", set()
+        return "Hello! Ask me anything, upload a file or image, or ask about current events.", []
 
-    results = vectorstore.similarity_search(question, k=6)
-    context = "\n\n".join([doc.page_content for doc in results])
+    time_keywords = ["current time", "what time is it", "time right now", "current date", "today's date", "what day is it"]
+    if any(kw in question.lower() for kw in time_keywords):
+        return "Here's the current date and time:\n\n" + get_current_time(), []
 
-    sources = set()
-    for doc in results:
-        src = doc.metadata.get("source", "unknown")
-        page = doc.metadata.get("page", "?")
-        sources.add(f"{src}, page {page}")
+    # Separate images from text-based documents
+    image_files = [f for f in (uploaded_files or []) if f.type.startswith("image/")]
+    doc_files = [f for f in (uploaded_files or []) if not f.type.startswith("image/")]
 
-    prompt = f"""You have two sources of knowledge: the context below (from the user's documents) and your own general knowledge.
+    doc_context = ""
+    for f in doc_files:
+        f.seek(0)
+        doc_context += f"\n\n--- Content from {f.name} ---\n{extract_text_from_upload(f)}"
 
-Instructions:
-1. First, try to answer using the context below.
-2. If the context contains a relevant answer, use it.
-3. If the context does NOT contain a relevant answer, answer using your own general knowledge instead.
-4. At the very end of your answer, on a new line, write exactly one of these tags: [SOURCE: DOCUMENT] or [SOURCE: GENERAL]
+    # If images are uploaded, use Gemini's vision capability
+    if image_files:
+        content = [{"type": "text", "text": f"{doc_context}\n\nQuestion: {question}" if doc_context else question}]
+        for img_file in image_files:
+            img_file.seek(0)
+            img_bytes = img_file.read()
+            b64_img = base64.b64encode(img_bytes).decode("utf-8")
+            content.append({
+                "type": "image_url",
+                "image_url": f"data:{img_file.type};base64,{b64_img}"
+            })
+        message = HumanMessage(content=content)
+        response = llm.invoke([message])
+        answer_text = response.content[0]["text"] if isinstance(response.content, list) else response.content
+        return answer_text, [f.name for f in image_files + doc_files]
 
-Context from documents:
-{context}
+    sources = []
+    search_context = ""
+
+    if needs_search(question) and not doc_context:
+        search_results = tavily.search(query=question, max_results=4)
+        for r in search_results.get("results", []):
+            search_context += f"{r['content']}\n\n"
+            sources.append(r["url"])
+
+    combined_context = doc_context + "\n\n" + search_context
+
+    if combined_context.strip():
+        prompt = f"""Answer the question using the context below where relevant, combined with your own knowledge.
+
+Context:
+{combined_context}
 
 Question: {question}
 
-Answer:"""
+Answer clearly and concisely."""
+    else:
+        prompt = f"Answer this question using your general knowledge: {question}"
 
     response = llm.invoke(prompt)
     answer_text = response.content[0]["text"] if isinstance(response.content, list) else response.content
 
-    used_document = "[SOURCE: DOCUMENT]" in answer_text
-    answer_text = answer_text.replace("[SOURCE: DOCUMENT]", "").replace("[SOURCE: GENERAL]", "").strip()
-
-    if not used_document:
-        sources = set()
+    if doc_files:
+        sources = [f.name for f in doc_files] + sources
 
     return answer_text, sources
 
@@ -87,7 +149,7 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
 
-question = st.chat_input("Ask a question about your documents...")
+question = st.chat_input("Ask me anything, or ask about your uploaded files...")
 
 if question:
     st.session_state.messages.append({"role": "user", "content": question})
@@ -96,9 +158,9 @@ if question:
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            answer, sources = answer_question(question)
+            answer, sources = answer_question(question, uploaded_files)
             st.write(answer)
             if sources:
-                st.caption("📚 Sources: " + ", ".join(sorted(sources)))
+                st.caption("📎 Sources: " + ", ".join(sources))
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
